@@ -33,6 +33,9 @@ public:
     
     using _IORegistryEntry_getProperty_t = OSObject * (*)(const IORegistryEntry *that, const OSSymbol *aKey);
     using _IORegistryEntry_getProperty_cstring_t = OSObject * (*)(const IORegistryEntry *that, const char *aKey);
+
+    using _IODTNVRAM_copyProperty_cstring_t =
+        OSObject * (*)(const IORegistryEntry *that, const char *aKey);
 };
 
 #endif /* kern_ioreg_hpp */
