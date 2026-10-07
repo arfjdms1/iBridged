@@ -10,6 +10,9 @@
 static IOR::_IORegistryEntry_getProperty_t original_IORegistryEntry_getProperty_os_symbol = nullptr;
 static IOR::_IORegistryEntry_getProperty_cstring_t original_IORegistryEntry_getProperty_cstring = nullptr;
 
+static IOR::_IODTNVRAM_copyProperty_cstring_t
+    original_IODTNVRAM_copyProperty_cstring = nullptr;
+
 const IBGD::DetectedProcess IOR::filteredProcs[] = {
     {"ramrod", 0},
     {"softwareupdated", 0},
@@ -93,6 +96,82 @@ static bool isProcFiltered(const char *procName) {
 
 OSObject *ibgd_IORegistryEntry_getProperty_os_symbol(const IORegistryEntry *that, const OSSymbol *aKey);
 
+OSObject *ibgd_IODTNVRAM_copyProperty_cstring(
+    const IORegistryEntry *that,
+    const char *aKey
+) {
+    OSObject *original_property = nullptr;
+
+    if (original_IODTNVRAM_copyProperty_cstring) {
+        original_property =
+            original_IODTNVRAM_copyProperty_cstring(that, aKey);
+    }
+
+    proc_t p = current_proc();
+    pid_t pid = proc_pid(p);
+
+    char procName[MAX_PROC_NAME_LEN] {};
+    proc_name(pid, procName, sizeof(procName));
+
+    if (!aKey) {
+        return original_property;
+    }
+
+    if (isProcFiltered(procName) &&
+        strcmp(procName, "launchd") != 0 &&
+        strcmp(
+            aKey,
+            "94B73556-2197-4702-82A8-3E1337DAFBFB:ApBoardID"
+        ) == 0) {
+
+        OSData *realBoard =
+            OSDynamicCast(OSData, original_property);
+
+        if (realBoard && realBoard->getLength() >= 4) {
+            const uint8_t *bytes =
+                static_cast<const uint8_t *>(
+                    realBoard->getBytesNoCopy()
+                );
+
+            if (bytes &&
+                bytes[0] == 0x3F &&
+                bytes[1] == 0x00 &&
+                bytes[2] == 0x00 &&
+                bytes[3] == 0x00) {
+
+                static const uint8_t spoofedBoard[4] = {
+                    0x3E, 0x00, 0x00, 0x00
+                };
+
+                OSData *spoofed =
+                    OSData::withBytes(
+                        spoofedBoard,
+                        sizeof(spoofedBoard)
+                    );
+
+                if (spoofed) {
+                    DBGLOG(
+                        MODULE_IOR,
+                        "'%s' (PID %d): IODTNVRAM::copyProperty "
+                        "spoofing ApBoardID 0x3F -> 0x3E",
+                        procName,
+                        pid
+                    );
+
+                    if (original_property) {
+                        original_property->release();
+                    }
+
+                    return spoofed;
+                }
+            }
+        }
+    }
+
+    return original_property;
+}
+
+
 // This is the new hook for the getProperty(const char*) variant.
 OSObject *ibgd_IORegistryEntry_getProperty_cstring(const IORegistryEntry *that, const char *aKey) {
     
@@ -124,46 +203,6 @@ OSObject *ibgd_IORegistryEntry_getProperty_os_symbol(const IORegistryEntry *that
     if (keyName && strcmp(keyName, "apple-coprocessor-version") == 0) {
         DBGLOG(MODULE_IOR, "'%s' (PID: %d) is attempting to access 'apple-coprocessor-version'.",
                procName, pid);
-    }
-
-    // Spoof the T2 secure-boot board ID only for update-related processes.
-    // Real J230K = 0x3F; Tahoe J214K expects 0x3E.
-    if (isProcFiltered(procName) &&
-        keyName &&
-        strcmp(keyName, "94B73556-2197-4702-82A8-3E1337DAFBFB:ApBoardID") == 0 &&
-        strcmp(procName, "launchd") != 0) {
-
-        OSData *realBoard = OSDynamicCast(OSData, original_property);
-
-        if (realBoard && realBoard->getLength() >= 4) {
-            const unsigned char *bytes =
-                static_cast<const unsigned char *>(
-                    realBoard->getBytesNoCopy()
-                );
-
-            if (bytes &&
-                bytes[0] == 0x3F &&
-                bytes[1] == 0x00 &&
-                bytes[2] == 0x00 &&
-                bytes[3] == 0x00) {
-
-                static const unsigned char spoofedBoard[4] = {
-                    0x3E, 0x00, 0x00, 0x00
-                };
-
-                DBGLOG(
-                    MODULE_IOR,
-                    "'%s' (PID: %d) spoofing ApBoardID 0x3F -> 0x3E.",
-                    procName,
-                    pid
-                );
-
-                return OSData::withBytes(
-                    spoofedBoard,
-                    sizeof(spoofedBoard)
-                );
-            }
-        }
     }
 
     // Check if the process is one we want to target.
@@ -198,6 +237,45 @@ OSObject *ibgd_IORegistryEntry_getProperty_os_symbol(const IORegistryEntry *that
 void IOR::init(KernelPatcher &Patcher) {
     
     DBGLOG(MODULE_IOR, "IOR::init(Patcher) called. IORegistry module is starting.");
+
+    
+    KernelPatcher::RouteRequest nvramRequests[] = {
+        {
+            "__ZNK9IODTNVRAM12copyPropertyEPKc",
+            ibgd_IODTNVRAM_copyProperty_cstring,
+            original_IODTNVRAM_copyProperty_cstring
+        }
+    };
+
+    mach_vm_address_t nvramCopyAddr =
+        Patcher.solveSymbol(
+            KernelPatcher::KernelID,
+            nvramRequests[0].symbol
+        );
+
+    if (!nvramCopyAddr) {
+        DBGLOG(
+            MODULE_ERROR,
+            "Could not resolve IODTNVRAM::copyProperty(const char *)"
+        );
+    } else {
+        DBGLOG(
+            MODULE_IOR,
+            "Resolved IODTNVRAM::copyProperty(const char *) at 0x%llx",
+            nvramCopyAddr
+        );
+
+        if (!Patcher.routeMultipleLong(
+                KernelPatcher::KernelID,
+                nvramRequests,
+                1)) {
+            DBGLOG(
+                MODULE_ERROR,
+                "Failed to route IODTNVRAM::copyProperty(const char *)"
+            );
+        }
+    }
+
 
     // Route Requests for getProperty
     KernelPatcher::RouteRequest requests[] = {
