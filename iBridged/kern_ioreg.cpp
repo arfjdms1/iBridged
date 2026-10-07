@@ -126,11 +126,49 @@ OSObject *ibgd_IORegistryEntry_getProperty_os_symbol(const IORegistryEntry *that
                procName, pid);
     }
 
+    // Spoof the T2 secure-boot board ID only for update-related processes.
+    // Real J230K = 0x3F; Tahoe J214K expects 0x3E.
+    if (isProcFiltered(procName) &&
+        keyName &&
+        strcmp(keyName, "94B73556-2197-4702-82A8-3E1337DAFBFB:ApBoardID") == 0 &&
+        strcmp(procName, "launchd") != 0) {
+
+        OSData *realBoard = OSDynamicCast(OSData, original_property);
+
+        if (realBoard && realBoard->getLength() >= 4) {
+            const unsigned char *bytes =
+                static_cast<const unsigned char *>(
+                    realBoard->getBytesNoCopy()
+                );
+
+            if (bytes &&
+                bytes[0] == 0x3F &&
+                bytes[1] == 0x00 &&
+                bytes[2] == 0x00 &&
+                bytes[3] == 0x00) {
+
+                static const unsigned char spoofedBoard[4] = {
+                    0x3E, 0x00, 0x00, 0x00
+                };
+
+                DBGLOG(
+                    MODULE_IOR,
+                    "'%s' (PID: %d) spoofing ApBoardID 0x3F -> 0x3E.",
+                    procName,
+                    pid
+                );
+
+                return OSData::withBytes(
+                    spoofedBoard,
+                    sizeof(spoofedBoard)
+                );
+            }
+        }
+    }
+
     // Check if the process is one we want to target.
     if (isProcFiltered(procName))
     {
-        const char *keyName = aKey->getCStringNoCopy();
-
         if (keyName && strcmp(keyName, "apple-coprocessor-version") == 0) {
             const char* entryClassName = that->getMetaClass()->getClassName();
             /* oh god oh fuck what am i even doing anymore */
